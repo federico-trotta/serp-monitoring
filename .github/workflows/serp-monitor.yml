@@ -1,0 +1,83 @@
+name: SERP monitor
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      allow_empty_state:
+        description: "Start with an empty database if no saved state exists (first run only)"
+        type: boolean
+        default: false
+
+# One group for scheduled and manual runs; never cancel an active writer.
+concurrency:
+  group: serp-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  STATE_ARTIFACT: serp-monitor-state
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore latest saved state (monitor.db + snapshots)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALLOW_EMPTY: ${{ inputs.allow_empty_state || 'false' }}
+        run: |
+          set -euo pipefail
+          artifact_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${STATE_ARTIFACT}&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].id // empty')
+          if [ -z "$artifact_id" ]; then
+            if [ "$ALLOW_EMPTY" = "true" ]; then
+              echo "No saved state found; starting with an empty database (allowed by input)."
+              exit 0
+            fi
+            echo "::error::No saved state artifact found. Run the workflow manually with allow_empty_state=true for the first run."
+            exit 1
+          fi
+          echo "Restoring artifact $artifact_id"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > state.zip
+          unzip -o -q state.zip -d state
+          tar -xzf state/state.tar.gz
+          rm -rf state state.zip
+          test -f monitor.db || { echo "::error::Restored state has no monitor.db"; exit 1; }
+
+      - name: Run SERP monitor
+        id: monitor
+        env:
+          SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python main.py
+
+      - name: Package state
+        if: always() && hashFiles('monitor.db') != ''
+        run: |
+          mkdir -p snapshots
+          tar -czf state.tar.gz monitor.db snapshots
+
+      - name: Save state
+        if: always() && hashFiles('state.tar.gz') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STATE_ARTIFACT }}
+          path: state.tar.gz
+          retention-days: 90
+          if-no-files-found: error

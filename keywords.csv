@@ -1,0 +1,4 @@
+keyword,target_domain,country_code,locale,device,latitude,longitude,radius
+web scraping api,scrapingbee.com,us,en-US,desktop,,,
+serp api,scrapingbee.com,us,en-US,mobile,,,
+coffee shops,example.com,us,,desktop,41.8781,-87.6298,500
